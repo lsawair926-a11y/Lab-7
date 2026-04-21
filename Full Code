@@ -1,0 +1,240 @@
+#include "mbed.h"
+#include "arm_book_lib.h"
+
+#include "user_interface.h"
+#include "code.h"
+#include "siren.h"
+#include "smart_home_system.h"
+#include "fire_alarm.h"
+#include "date_and_time.h"
+#include "temperature_sensor.h"
+#include "gas_sensor.h"
+#include "matrix_keypad.h"
+#include "display.h"
+
+#define DISPLAY_REFRESH_TIME_MS 1000
+#define TEMP_WARNING_THRESHOLD 30
+
+BufferedSerial pc(USBTX, USBRX, 115200);
+
+void printMsg(const char *msg) {
+    pc.write(msg, strlen(msg));
+}
+
+char pendingMessage[60];
+bool newMessage = false;
+
+
+DigitalOut relayIn1(PF_2); 
+DigitalOut relayIn2(PE_3);
+
+
+DigitalOut gateOpeningLed(LED1);
+DigitalOut gateClosingLed(LED2);
+
+InterruptIn dir1Button(PF_9);
+InterruptIn dir2Button(PF_8);
+InterruptIn dir1LimitSwitch(PG_1);
+InterruptIn dir2LimitSwitch(PF_7);
+
+
+DigitalOut incorrectCodeLed(LED3);
+DigitalOut systemBlockedLed(PB_7);
+
+
+typedef enum {
+    GATE_STOPPED,
+    GATE_OPENING,
+    GATE_CLOSING
+} gateState_t;
+
+static gateState_t gateState = GATE_STOPPED;
+
+
+char codeSequenceFromUserInterface[CODE_NUMBER_OF_KEYS];
+char correctCode[CODE_NUMBER_OF_KEYS] = {'1','2','1','1','1'};
+
+static bool incorrectCodeState = OFF;
+static bool systemBlockedState = OFF;
+static bool showGasReport = false;
+static bool showTempReport = false;
+static bool codeComplete = false;
+static int numberOfCodeChars = 0;
+
+
+void stopMotor() {
+    relayIn1 = OFF;
+    relayIn2 = OFF;
+    gateOpeningLed = OFF;
+    gateClosingLed = OFF;
+    gateState = GATE_STOPPED;
+
+    strcpy(pendingMessage, "INT: LIMIT SWITCH -> Gate STOPPED\r\n");
+    newMessage = true;
+}
+
+void openGate() {
+    relayIn1 = ON;
+    relayIn2 = OFF;
+    gateOpeningLed = ON;
+    gateClosingLed = OFF;
+    gateState = GATE_OPENING;
+
+    strcpy(pendingMessage, "INT: OPEN BUTTON -> Gate OPENING\r\n");
+    newMessage = true;
+}
+
+void closeGate() {
+    relayIn1 = OFF;
+    relayIn2 = ON;
+    gateOpeningLed = OFF;
+    gateClosingLed = ON;
+    gateState = GATE_CLOSING;
+
+    strcpy(pendingMessage, "INT: CLOSE BUTTON -> Gate CLOSING\r\n");
+    newMessage = true;
+}
+
+
+bool isCodeCorrect() {
+    for (int i = 0; i < CODE_NUMBER_OF_KEYS; i++) {
+        if (codeSequenceFromUserInterface[i] != correctCode[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void userInterfaceMatrixKeypadUpdate();
+static void incorrectCodeIndicatorUpdate();
+static void systemBlockedIndicatorUpdate();
+static void userInterfaceDisplayInit();
+static void userInterfaceDisplayUpdate();
+
+
+void userInterfaceInit()
+{
+    incorrectCodeLed = OFF;
+    systemBlockedLed = OFF;
+
+    stopMotor();
+
+
+    dir1Button.rise(&openGate);
+    dir2Button.rise(&closeGate);
+    dir1LimitSwitch.rise(&stopMotor);
+    dir2LimitSwitch.rise(&stopMotor);
+
+    matrixKeypadInit(SYSTEM_TIME_INCREMENT_MS);
+    userInterfaceDisplayInit();
+
+    printMsg("System Ready\r\n");
+}
+
+
+void userInterfaceUpdate()
+{
+    userInterfaceMatrixKeypadUpdate();
+    incorrectCodeIndicatorUpdate();
+    systemBlockedIndicatorUpdate();
+    userInterfaceDisplayUpdate();
+
+
+    if (newMessage) {
+        printMsg(pendingMessage);
+        newMessage = false;
+    }
+}
+
+bool incorrectCodeStateRead() { return incorrectCodeState; }
+void incorrectCodeStateWrite(bool state) { incorrectCodeState = state; }
+bool systemBlockedStateRead() { return systemBlockedState; }
+void systemBlockedStateWrite(bool state) { systemBlockedState = state; }
+bool userInterfaceCodeCompleteRead() { return codeComplete; }
+void userInterfaceCodeCompleteWrite(bool state) { codeComplete = state; }
+
+
+static void userInterfaceMatrixKeypadUpdate()
+{
+    static int numberOfHashKeyReleased = 0;
+    char keyReleased = matrixKeypadUpdate();
+
+    if (keyReleased == '\0') return;
+
+    if (keyReleased == 'A') openGate();
+    if (keyReleased == 'B') closeGate();
+    if (keyReleased == 'C') stopMotor();
+
+    if (keyReleased == '4') { showGasReport = true; showTempReport = false; }
+    if (keyReleased == '5') { showTempReport = true; showGasReport = false; }
+
+    if (sirenStateRead() && !systemBlockedStateRead()) {
+        if (!incorrectCodeStateRead()) {
+            codeSequenceFromUserInterface[numberOfCodeChars++] = keyReleased;
+
+            if (numberOfCodeChars >= CODE_NUMBER_OF_KEYS) {
+                if (isCodeCorrect()) {
+                    sirenStateWrite(OFF);
+                    printMsg("Correct Code -> Alarm OFF\r\n");
+                } else {
+                    incorrectCodeState = ON;
+                    printMsg("Incorrect Code\r\n");
+                }
+                codeComplete = true;
+                numberOfCodeChars = 0;
+            }
+        } else {
+            if (keyReleased == '#') {
+                numberOfHashKeyReleased++;
+                if (numberOfHashKeyReleased >= 2) {
+                    numberOfHashKeyReleased = 0;
+                    numberOfCodeChars = 0;
+                    codeComplete = false;
+                    incorrectCodeState = OFF;
+                    printMsg("Reset Code Entry\r\n");
+                }
+            }
+        }
+    }
+}
+
+
+static void userInterfaceDisplayInit()
+{
+    displayInit(DISPLAY_CONNECTION_I2C_PCF8574_IO_EXPANDER);
+}
+
+static void userInterfaceDisplayUpdate()
+{
+    static int accumulatedDisplayTime = 0;
+
+    if (accumulatedDisplayTime >= DISPLAY_REFRESH_TIME_MS) {
+        accumulatedDisplayTime = 0;
+
+        char tempStr[16];
+        sprintf(tempStr, "Temp: %.0f'C    ", temperatureSensorReadCelsius());
+        displayCharPositionWrite(0, 0);
+        displayStringWrite(tempStr);
+
+        displayCharPositionWrite(0, 1);
+        if (gasDetectorStateRead())
+            displayStringWrite("Gas: DETECTED! ");
+        else
+            displayStringWrite("Gas: Safe      ");
+
+        displayCharPositionWrite(0, 2);
+        if (gateState == GATE_OPENING)
+            displayStringWrite("Gate: OPENING  ");
+        else if (gateState == GATE_CLOSING)
+            displayStringWrite("Gate: CLOSING  ");
+        else
+            displayStringWrite("Gate: STOPPED  ");
+
+    } else {
+        accumulatedDisplayTime += SYSTEM_TIME_INCREMENT_MS;
+    }
+}
+
+
+static void incorrectCodeIndicatorUpdate() { incorrectCodeLed = incorrectCodeState; }
+static void systemBlockedIndicatorUpdate() { systemBlockedLed = systemBlockedState; }
